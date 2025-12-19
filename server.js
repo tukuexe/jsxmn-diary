@@ -1,0 +1,301 @@
+const express = require('express');
+const mongoose = require('mongoose');
+require('dotenv').config();
+
+const app = express();
+app.use(express.json());
+app.use(require('cors')());
+
+const PORT = process.env.PORT || 3001;
+const PRIMARY_URL = process.env.PRIMARY_URL || 'http://localhost:3000';
+const MONGO_URI = process.env.MONGO_URI;
+
+// ==================== DATABASE CONNECTION ====================
+mongoose.connect(MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+}).then(() => console.log('✅ Monitoring MongoDB Connected'))
+  .catch(err => {
+      console.error('❌ Monitoring MongoDB Error:', err);
+      process.exit(1);
+  });
+
+const ServiceStatusSchema = new mongoose.Schema({
+    service: String,
+    status: String,
+    lastPing: Date,
+    responseTime: Number,
+    error: String,
+    timestamp: { type: Date, default: Date.now, index: true }
+});
+
+const EmergencyLogSchema = new mongoose.Schema({
+    type: String,
+    message: String,
+    data: Object,
+    timestamp: { type: Date, default: Date.now, index: true }
+});
+
+const ServiceStatus = mongoose.model('ServiceStatus', ServiceStatusSchema);
+const EmergencyLog = mongoose.model('EmergencyLog', EmergencyLogSchema);
+
+// ==================== PRIMARY SERVICE MONITORING ====================
+let primaryServiceDown = false;
+let retryCount = 0;
+const MAX_RETRIES = 10;
+
+async function checkPrimaryService() {
+    try {
+        const startTime = Date.now();
+        const response = await fetch(`${PRIMARY_URL}/api/health`, {
+            timeout: 10000 // 10 second timeout
+        });
+        const responseTime = Date.now() - startTime;
+        
+        if (response.ok) {
+            const data = await response.json();
+            
+            await ServiceStatus.create({
+                service: 'primary',
+                status: 'healthy',
+                lastPing: new Date(),
+                responseTime
+            });
+            
+            if (primaryServiceDown) {
+                console.log('✅ Primary service restored!');
+                primaryServiceDown = false;
+                retryCount = 0;
+                
+                // Log recovery
+                await EmergencyLog.create({
+                    type: 'service_recovery',
+                    message: 'Primary service has recovered',
+                    data: { responseTime }
+                });
+            }
+            
+            return true;
+        } else {
+            throw new Error(`HTTP ${response.status}`);
+        }
+    } catch (error) {
+        retryCount++;
+        
+        await ServiceStatus.create({
+            service: 'primary',
+            status: 'down',
+            lastPing: new Date(),
+            error: error.message
+        });
+        
+        if (!primaryServiceDown) {
+            console.log(`⚠️ Primary service down: ${error.message}`);
+            primaryServiceDown = true;
+            
+            // Log emergency
+            await EmergencyLog.create({
+                type: 'service_down',
+                message: 'Primary service is not responding',
+                data: { error: error.message, retryCount }
+            });
+        }
+        
+        // Try to wake up primary service
+        if (retryCount <= MAX_RETRIES) {
+            await attemptServiceRecovery();
+        } else {
+            console.log('🚨 Max retries reached. Manual intervention required.');
+        }
+        
+        return false;
+    }
+}
+
+async function attemptServiceRecovery() {
+    try {
+        // Try to "wake up" the primary service by calling a simple endpoint
+        console.log(`🔄 Attempting to wake primary service (attempt ${retryCount})...`);
+        
+        // We'll make multiple types of requests to trigger Render's auto-restart
+        await fetch(`${PRIMARY_URL}/`, { timeout: 5000 }).catch(() => {});
+        await fetch(`${PRIMARY_URL}/api/health`, { timeout: 5000 }).catch(() => {});
+        
+        await EmergencyLog.create({
+            type: 'recovery_attempt',
+            message: `Attempted to wake primary service`,
+            data: { attempt: retryCount }
+        });
+        
+    } catch (error) {
+        console.log(`❌ Recovery attempt failed: ${error.message}`);
+    }
+}
+
+// ==================== HEALTH CHECK ENDPOINTS ====================
+app.get('/api/health', async (req, res) => {
+    const mongoStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+    
+    // Check primary service status
+    const primaryHealthy = await checkPrimaryService();
+    
+    res.json({
+        status: 'healthy',
+        service: 'monitoring',
+        timestamp: new Date().toISOString(),
+        mongodb: mongoStatus,
+        primaryService: {
+            url: PRIMARY_URL,
+            status: primaryHealthy ? 'healthy' : 'down',
+            lastChecked: new Date().toISOString()
+        },
+        uptime: process.uptime()
+    });
+});
+
+app.post('/api/ping', async (req, res) => {
+    const { service, timestamp, status } = req.body;
+    
+    console.log(`📡 Ping received from ${service} at ${timestamp}`);
+    
+    await ServiceStatus.create({
+        service: service,
+        status: status || 'alive',
+        lastPing: new Date(),
+        responseTime: 0
+    });
+    
+    res.json({ 
+        received: true, 
+        timestamp: new Date().toISOString(),
+        message: 'Ping acknowledged' 
+    });
+});
+
+app.get('/api/status/history', async (req, res) => {
+    try {
+        const history = await ServiceStatus.find()
+            .sort({ timestamp: -1 })
+            .limit(100);
+        
+        const emergencies = await EmergencyLog.find()
+            .sort({ timestamp: -1 })
+            .limit(50);
+        
+        res.json({ history, emergencies });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch status history' });
+    }
+});
+
+app.post('/api/emergency/alert', async (req, res) => {
+    try {
+        const { type, message, data } = req.body;
+        
+        await EmergencyLog.create({
+            type,
+            message,
+            data,
+            timestamp: new Date()
+        });
+        
+        console.log(`🚨 Emergency logged: ${type} - ${message}`);
+        
+        // Here you could integrate with external alerting services
+        // like Twilio SMS, Email, Discord webhook, etc.
+        
+        res.json({ success: true, logged: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to log emergency' });
+    }
+});
+
+// ==================== BACKUP API ENDPOINTS ====================
+// These endpoints act as backup if primary is down
+app.post('/api/backup/login', async (req, res) => {
+    // In emergency mode, only allow login with location
+    const { location } = req.body;
+    
+    if (!location) {
+        return res.status(403).json({
+            error: 'EMERGENCY MODE: Location permission REQUIRED',
+            emergency: true,
+            backupMode: true
+        });
+    }
+    
+    res.json({
+        success: true,
+        message: 'Backup service active - Limited functionality',
+        backupMode: true,
+        timestamp: new Date().toISOString()
+    });
+});
+
+app.get('/api/backup/status', async (req, res) => {
+    const primaryStatus = await ServiceStatus.findOne({ service: 'primary' })
+        .sort({ timestamp: -1 });
+    
+    res.json({
+        service: 'monitoring_backup',
+        primaryStatus: primaryStatus || { status: 'unknown' },
+        backupActive: true,
+        timestamp: new Date().toISOString(),
+        message: primaryServiceDown ? 
+            '⚠️ Primary service is down. Backup mode active.' : 
+            '✅ All services operational.'
+    });
+});
+
+// ==================== SERVICE KEEP-ALIVE ====================
+async function keepPrimaryAlive() {
+    if (primaryServiceDown) {
+        console.log('🔄 Attempting to revive primary service...');
+        
+        // Try multiple endpoints to trigger wake-up
+        const endpoints = ['/', '/api/health', '/login', '/home'];
+        
+        for (const endpoint of endpoints) {
+            try {
+                await fetch(`${PRIMARY_URL}${endpoint}`, { 
+                    method: 'HEAD',
+                    timeout: 3000 
+                });
+                console.log(`✅ ${endpoint} - Request sent`);
+            } catch (error) {
+                console.log(`❌ ${endpoint} - Failed: ${error.message}`);
+            }
+            
+            // Wait between requests
+            await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        
+        await EmergencyLog.create({
+            type: 'keep_alive_attempt',
+            message: 'Attempted to keep primary service alive',
+            data: { endpointsAttempted: endpoints.length }
+        });
+    }
+}
+
+// ==================== START MONITORING SERVER ====================
+app.listen(PORT, () => {
+    console.log(`✅ Monitoring server running on port ${PORT}`);
+    console.log(`🔗 Monitoring primary: ${PRIMARY_URL}`);
+    
+    // Initial check
+    checkPrimaryService();
+    
+    // Check primary service every 30 seconds
+    setInterval(checkPrimaryService, 30000);
+    
+    // Keep-alive attempts every 2 minutes if primary is down
+    setInterval(keepPrimaryAlive, 120000);
+    
+    // Log startup
+    EmergencyLog.create({
+        type: 'startup',
+        message: 'Monitoring service started',
+        data: { port: PORT, primaryUrl: PRIMARY_URL }
+    });
+});
